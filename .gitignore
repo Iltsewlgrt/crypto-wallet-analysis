@@ -16,3 +16,8 @@ outputs/**
 # OS
 Thumbs.db
 Desktop.ini
+
+# Build artifacts
+dist/
+build/
+*.spec

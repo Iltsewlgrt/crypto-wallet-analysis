@@ -116,3 +116,27 @@ outputs/raw/<network>/network_graph_<address_prefix>.png
 ## Архитектура
 
 Подробно: `docs/ARCHITECTURE.md`
+
+## Сборка в EXE (Windows)
+
+Сборка делается через **PyInstaller**.
+
+1) Подготовьте окружение и зависимости (см. раздел «Быстрый старт»).
+
+2) Соберите exe из корня проекта:
+
+```powershell
+./scripts/build_exe.ps1
+```
+
+Готовый файл будет здесь:
+
+```
+dist/CryptoWalletAnalyzer/CryptoWalletAnalyzer.exe
+```
+
+Если PowerShell запрещает запуск локальных скриптов, временно разрешите:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
