@@ -1,8 +1,0 @@
-{
-  "python.defaultInterpreterPath": "C:/Users/dip663322o2244/AppData/Local/Programs/Python/Python313/python.exe",
-  "python.terminal.activateEnvironment": false,
-  "terminal.integrated.env.windows": {
-    "PATH": "C:/Users/dip663322o2244/AppData/Local/Programs/Python/Python313;C:/Users/dip663322o2244/AppData/Local/Programs/Python/Python313/Scripts;${env:PATH}"
-},
-"python-envs.defaultEnvManager": "ms-python.python:system"
-}

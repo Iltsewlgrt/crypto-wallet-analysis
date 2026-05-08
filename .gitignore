@@ -6,4 +6,13 @@ __pycache__/
 .env
 .venv/
 venv/
-outputs/raw/
+outputs/**
+!outputs/.gitkeep
+
+# IDE / editor
+.idea/
+.vscode/
+
+# OS
+Thumbs.db
+Desktop.ini
