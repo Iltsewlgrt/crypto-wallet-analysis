@@ -5,7 +5,7 @@ from app.data.api.explorer_client import ExplorerApiClient
 from app.data.repositories.transaction_repository import TransactionRepository
 from app.domain.models.network import Network
 from app.domain.models.results import SavedRawPaths, WalletFetchResult
-from app.domain.models.validators import AddressFamily, detect_address_family
+from app.domain.models.validators import AddressFamily, detect_address_family, extract_wallet_address
 from app.services.wallet_analysis_service import WalletAnalysisService, TransactionCategory
 from app.services.ai_service import AIService
 
@@ -116,7 +116,9 @@ class WalletDataService:
         )
 
     def _normalize_and_validate_address(self, address: str) -> str:
-        normalized = address.strip()
+        # Make copy/paste forgiving: allow full URLs or text containing the address.
+        extracted = extract_wallet_address(address)
+        normalized = extracted if extracted is not None else address.strip()
         family = detect_address_family(normalized)
 
         if family in {AddressFamily.EVM, AddressFamily.TON}:

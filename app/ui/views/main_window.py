@@ -113,6 +113,8 @@ class FetchWorker(QObject):
     success = Signal(object)
     failure = Signal(str)
 
+    CANCELLED_ERROR = "__CANCELLED__"
+
     def __init__(
         self,
         data_service: WalletDataService,
@@ -121,18 +123,37 @@ class FetchWorker(QObject):
         super().__init__()
         self._data_service = data_service
         self._address = address
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _is_cancelled(self) -> bool:
+        return self._cancel_requested or QThread.currentThread().isInterruptionRequested()
 
     @Slot()
     def run(self) -> None:
         try:
+            if self._is_cancelled():
+                self.failure.emit(self.CANCELLED_ERROR)
+                return
+
             self.progress.emit("Определение сети (1/4)...", 18)
             network = self._data_service.detect_network(address=self._address)
+
+            if self._is_cancelled():
+                self.failure.emit(self.CANCELLED_ERROR)
+                return
 
             self.progress.emit(f"Загрузка транзакций из {network.ui_label} (2/4)...", 46)
             transactions = self._data_service.fetch_transactions(
                 address=self._address,
                 network=network,
             )
+
+            if self._is_cancelled():
+                self.failure.emit(self.CANCELLED_ERROR)
+                return
 
             self.progress.emit("Сохранение сырых данных (3/4)...", 72)
             saved_paths = self._data_service.save_raw_transactions(
@@ -141,6 +162,10 @@ class FetchWorker(QObject):
                 transactions=transactions,
             )
 
+            if self._is_cancelled():
+                self.failure.emit(self.CANCELLED_ERROR)
+                return
+
             self.progress.emit("Формирование сводки (4/4)...", 92)
             result = self._data_service.build_result(
                 address=self._address,
@@ -148,6 +173,10 @@ class FetchWorker(QObject):
                 transactions=transactions,
                 saved_paths=saved_paths,
             )
+
+            if self._is_cancelled():
+                self.failure.emit(self.CANCELLED_ERROR)
+                return
 
             self.progress.emit("Готово", 100)
             self.success.emit(result)
@@ -163,10 +192,12 @@ class MainWindow(QMainWindow):
         self._data_service = data_service
         self._thread: QThread | None = None
         self._worker: FetchWorker | None = None
+        self._orphan_threads: list[QThread] = []
         self._displayed_transactions: list[dict] = []
         self._current_result: WalletFetchResult | None = None
 
         self._pulse_state = False
+        self._cancel_requested = False
         self._analyze_button_timer = QTimer(self)
         self._analyze_button_timer.setInterval(600)
         self._analyze_button_timer.timeout.connect(self._animate_analyze_button)
@@ -366,9 +397,16 @@ class MainWindow(QMainWindow):
             return
         try:
             import networkx as nx
+            from collections import Counter, defaultdict
             from matplotlib.figure import Figure
+            from matplotlib import cm
+            from matplotlib import colors as mcolors
+            from matplotlib.patches import Patch
             G = nx.DiGraph()
             main_addr = self._current_result.address.lower()
+
+            analysis_service = self._data_service._analysis_service
+            counterparty_category_counts: dict[str, Counter[str]] = defaultdict(Counter)
             for tx in self._current_result.transactions:
                 if "in_msg" in tx or "out_msgs" in tx:
                     in_msg = tx.get("in_msg")
@@ -390,6 +428,30 @@ class MainWindow(QMainWindow):
                     t_adr = str(tx.get("to", "")).lower()
                     if f_adr and t_adr and f_adr != "-" and t_adr != "-":
                         G.add_edge(f_adr, t_adr)
+
+                # Сбор категории для контрагентов (для раскраски узлов)
+                try:
+                    category_label = analysis_service.classify_transaction(tx, main_addr).value
+                except Exception:  # noqa: BLE001
+                    category_label = "Прочее"
+
+                # Приводим участников к одному формату (EVM/TON)
+                tx_from = ""
+                tx_to = ""
+                if isinstance(tx, dict) and ("in_msg" in tx or "out_msgs" in tx):
+                    in_msg = tx.get("in_msg") if isinstance(tx.get("in_msg"), dict) else {}
+                    tx_from = str(in_msg.get("source") or in_msg.get("src") or "").lower()
+                    tx_to = str(in_msg.get("destination") or in_msg.get("dest") or "").lower()
+                else:
+                    tx_from = str(tx.get("from", "")).lower()
+                    tx_to = str(tx.get("to", "")).lower()
+
+                if tx_from and tx_to and tx_from != "-" and tx_to != "-":
+                    if tx_from == main_addr and tx_to != main_addr:
+                        counterparty_category_counts[tx_to][category_label] += 1
+                    elif tx_to == main_addr and tx_from != main_addr:
+                        counterparty_category_counts[tx_from][category_label] += 1
+
             if G.number_of_nodes() == 0:
                 self._show_error("Недостаточно данных для построения графа связей")
                 return
@@ -400,14 +462,27 @@ class MainWindow(QMainWindow):
                 pos = nx.spring_layout(G, k=0.5, iterations=30, seed=42)
             else:
                 pos = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
-            node_colors = []
-            node_sizes = []
+            # Назначаем каждой вершине "доминирующую" категорию (по частоте)
+            node_to_category: dict[str, str] = {}
+            for node, counts in counterparty_category_counts.items():
+                if counts:
+                    node_to_category[node] = counts.most_common(1)[0][0]
+
+            categories_in_graph = sorted({cat for cat in node_to_category.values() if cat})
+            cmap = cm.get_cmap("tab20", max(1, len(categories_in_graph)))
+            category_color_map: dict[str, str] = {}
+            for idx, cat in enumerate(categories_in_graph):
+                category_color_map[cat] = mcolors.to_hex(cmap(idx))
+
+            node_colors: list[str] = []
+            node_sizes: list[int] = []
             for n in G.nodes():
                 if str(n).lower() == main_addr:
                     node_colors.append('#ff0055')
                     node_sizes.append(120)
                 else:
-                    node_colors.append('#00aabb')
+                    cat = node_to_category.get(str(n).lower())
+                    node_colors.append(category_color_map.get(cat, '#00aabb'))
                     node_sizes.append(40)
             nx.draw_networkx_nodes(G, pos, ax=ax, node_size=node_sizes, node_color=node_colors, alpha=0.9)
             nx.draw_networkx_edges(G, pos, ax=ax, edge_color='#ffffff', alpha=0.15, arrows=True, arrowsize=8, width=0.5)
@@ -416,6 +491,28 @@ class MainWindow(QMainWindow):
                 nx.draw_networkx_labels(G, pos, labels, font_size=7, font_color='#ffffff', ax=ax)
             ax.set_facecolor('#1E1E2E')
             ax.axis('off')
+
+            # Легенда: кошелек + основные категории контрагентов
+            legend_items: list[Patch] = [Patch(color="#ff0055", label="Кошелек")]
+            if categories_in_graph:
+                # Ограничим легенду, чтобы не занимала пол-экрана
+                top_cats = [
+                    cat for cat, _ in Counter(node_to_category.values()).most_common(8)
+                    if cat in category_color_map
+                ]
+                for cat in top_cats:
+                    legend_items.append(Patch(color=category_color_map[cat], label=cat))
+
+            if len(legend_items) > 1:
+                legend = ax.legend(
+                    handles=legend_items,
+                    loc="lower left",
+                    fontsize=8,
+                    frameon=False,
+                )
+                for text in legend.get_texts():
+                    text.set_color("white")
+
             fig.tight_layout()
             out_dir = self._get_export_dir()
             path = out_dir / f"network_graph_{self._current_result.address[:10]}.png"
@@ -450,6 +547,11 @@ class MainWindow(QMainWindow):
         self._loading_progress.setRange(0, 100)
         self._loading_progress.setValue(0)
         layout.addWidget(self._loading_progress, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._cancel_button = QPushButton("ОТМЕНА")
+        self._cancel_button.setMinimumHeight(40)
+        self._cancel_button.clicked.connect(self._cancel_fetch)
+        layout.addWidget(self._cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
         return page
 
@@ -711,6 +813,9 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentWidget(self._page_loading)
         self._loading_progress.setValue(0)
         self._loading_status.setText("Подготовка...")
+        self._cancel_requested = False
+        if hasattr(self, "_cancel_button"):
+            self._cancel_button.setEnabled(True)
 
         self._thread = QThread(self)
         self._worker = FetchWorker(
@@ -724,20 +829,77 @@ class MainWindow(QMainWindow):
         self._worker.success.connect(self._on_worker_success)
         self._worker.failure.connect(self._on_worker_failure)
 
+        # Корректная очистка объектов после завершения потока
+        self._thread.finished.connect(self._worker.deleteLater)
+
         self._worker.success.connect(self._cleanup_worker)
         self._worker.failure.connect(self._cleanup_worker)
         self._thread.finished.connect(self._thread.deleteLater)
 
         self._thread.start()
 
+    def _track_orphan_thread(self, thread: QThread) -> None:
+        if thread in self._orphan_threads:
+            return
+        self._orphan_threads.append(thread)
+
+        def _release() -> None:
+            try:
+                self._orphan_threads.remove(thread)
+            except ValueError:
+                pass
+
+        thread.finished.connect(_release)
+
+    def _stop_worker_thread(self, *, soft_wait_ms: int = 600, hard_wait_ms: int = 2000) -> bool:
+        thread = self._thread
+        if thread is None:
+            return True
+
+        if self._worker is not None:
+            try:
+                self._worker.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            thread.requestInterruption()
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            thread.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+        if thread.wait(soft_wait_ms):
+            return True
+
+        # Фоллбек: принудительное завершение (прототип)
+        try:
+            thread.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+        thread.wait(hard_wait_ms)
+        return not thread.isRunning()
+
     @Slot(str, int)
     def _on_worker_progress(self, status_text: str, progress: int) -> None:
+        if self.sender() is not self._worker:
+            return
+        if self._cancel_requested:
+            return
         self._loading_status.setText(status_text)
         self._loading_progress.setValue(progress)
         self._loading_cube.set_progress(progress)
 
     @Slot(object)
     def _on_worker_success(self, payload: Any) -> None:
+        if self.sender() is not self._worker:
+            return
+        if self._cancel_requested:
+            return
         if not isinstance(payload, WalletFetchResult):
             self._show_error("Получен неожиданный формат данных результата.")
             return
@@ -774,17 +936,113 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_worker_failure(self, error_message: str) -> None:
+        if self.sender() is not self._worker:
+            return
+        if error_message == FetchWorker.CANCELLED_ERROR:
+            return
+        if self._cancel_requested:
+            return
         self._show_error(error_message)
+
+    def _cancel_fetch(self) -> None:
+        # UI должен вернуться сразу. Остановить сетевой запрос мгновенно нельзя,
+        # поэтому делаем отмену "best-effort": просим воркер завершиться и
+        # даём потоку спокойно догнаться в фоне.
+        if self._thread is None:
+            self._go_to_init()
+            return
+
+        self._cancel_requested = True
+        if hasattr(self, "_cancel_button"):
+            self._cancel_button.setEnabled(False)
+
+        thread = self._thread
+        worker = self._worker
+
+        self._loading_status.setText("Отмена...")
+        self._loading_progress.setValue(0)
+        self._loading_cube.set_progress(0)
+
+        if worker is not None:
+            try:
+                worker.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            thread.requestInterruption()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Останавливаем event-loop QThread (как только воркер выйдет из run()).
+        try:
+            thread.quit()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Чтобы можно было сразу запускать новый анализ, отвязываем активный воркер/поток,
+        # но держим ссылку на поток, чтобы Qt не уничтожил его раньше завершения.
+        self._track_orphan_thread(thread)
+        self._thread = None
+        self._worker = None
+
+        self._go_to_init()
 
     @Slot()
     def _cleanup_worker(self) -> None:
+        if self.sender() is not self._worker:
+            return
         if self._thread is None:
             return
 
-        self._thread.quit()
-        self._thread.wait(1500)
+        # На обычном завершении/ошибке поток должен закрыться быстро.
+        self._stop_worker_thread(soft_wait_ms=1500, hard_wait_ms=2000)
+
+        if self._thread is not None:
+            try:
+                self._thread.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+
         self._thread = None
         self._worker = None
+
+    def _stop_thread(self, thread: QThread, *, soft_wait_ms: int = 600, hard_wait_ms: int = 2000) -> None:
+        try:
+            thread.requestInterruption()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            thread.quit()
+        except Exception:  # noqa: BLE001
+            pass
+        if thread.wait(soft_wait_ms):
+            return
+        try:
+            thread.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        thread.wait(hard_wait_ms)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        # Если пользователь закрывает окно во время загрузки — останавливаем поток,
+        # иначе Qt выдаст: "QThread: Destroyed while thread is still running".
+        self._cancel_requested = True
+
+        if self._thread is not None and self._thread.isRunning():
+            self._stop_thread(self._thread, soft_wait_ms=800, hard_wait_ms=2500)
+            self._thread = None
+            self._worker = None
+
+        # Также добиваем все "осиротевшие" потоки, если отмена была во время запроса.
+        for thread in list(self._orphan_threads):
+            if thread.isRunning():
+                self._stop_thread(thread, soft_wait_ms=800, hard_wait_ms=2500)
+
+        try:
+            event.accept()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _update_stats_display(self, category_stats: dict[str, int] | None) -> None:
         # Очистка старой статистики
@@ -1106,11 +1364,17 @@ class MainWindow(QMainWindow):
 
         try:
             import networkx as nx
+            from collections import Counter, defaultdict
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from matplotlib import cm
+            from matplotlib import colors as mcolors
+            from matplotlib.patches import Patch
 
             G = nx.DiGraph()
             main_addr = self._current_result.address.lower()
+            analysis_service = self._data_service._analysis_service
+            counterparty_category_counts: dict[str, Counter[str]] = defaultdict(Counter)
             for tx in self._current_result.transactions:
                 if "in_msg" in tx or "out_msgs" in tx:
                     in_msg = tx.get("in_msg")
@@ -1133,6 +1397,28 @@ class MainWindow(QMainWindow):
                     if f_adr and t_adr and f_adr != "-" and t_adr != "-":
                         G.add_edge(f_adr, t_adr)
 
+                # Сбор категории для контрагентов (для раскраски узлов)
+                try:
+                    category_label = analysis_service.classify_transaction(tx, main_addr).value
+                except Exception:  # noqa: BLE001
+                    category_label = "Прочее"
+
+                tx_from = ""
+                tx_to = ""
+                if isinstance(tx, dict) and ("in_msg" in tx or "out_msgs" in tx):
+                    in_msg = tx.get("in_msg") if isinstance(tx.get("in_msg"), dict) else {}
+                    tx_from = str(in_msg.get("source") or in_msg.get("src") or "").lower()
+                    tx_to = str(in_msg.get("destination") or in_msg.get("dest") or "").lower()
+                else:
+                    tx_from = str(tx.get("from", "")).lower()
+                    tx_to = str(tx.get("to", "")).lower()
+
+                if tx_from and tx_to and tx_from != "-" and tx_to != "-":
+                    if tx_from == main_addr and tx_to != main_addr:
+                        counterparty_category_counts[tx_to][category_label] += 1
+                    elif tx_to == main_addr and tx_from != main_addr:
+                        counterparty_category_counts[tx_from][category_label] += 1
+
             if G.number_of_nodes() == 0:
                 self._show_error("Недостаточно данных для построения графа связей")
                 return
@@ -1150,14 +1436,26 @@ class MainWindow(QMainWindow):
             else:
                 pos = nx.spring_layout(G, k=0.3, iterations=50, seed=42)
 
-            node_colors = []
-            node_sizes = []
+            node_to_category: dict[str, str] = {}
+            for node, counts in counterparty_category_counts.items():
+                if counts:
+                    node_to_category[node] = counts.most_common(1)[0][0]
+
+            categories_in_graph = sorted({cat for cat in node_to_category.values() if cat})
+            cmap = cm.get_cmap("tab20", max(1, len(categories_in_graph)))
+            category_color_map: dict[str, str] = {}
+            for idx, cat in enumerate(categories_in_graph):
+                category_color_map[cat] = mcolors.to_hex(cmap(idx))
+
+            node_colors: list[str] = []
+            node_sizes: list[int] = []
             for n in G.nodes():
                 if str(n).lower() == main_addr:
                     node_colors.append('#ff0055')
                     node_sizes.append(150)
                 else:
-                    node_colors.append('#00aabb')
+                    cat = node_to_category.get(str(n).lower())
+                    node_colors.append(category_color_map.get(cat, '#00aabb'))
                     node_sizes.append(50)
 
             nx.draw_networkx_nodes(G, pos, ax=ax, node_size=node_sizes, node_color=node_colors, alpha=0.9)
@@ -1168,6 +1466,26 @@ class MainWindow(QMainWindow):
 
             ax.set_facecolor('#1E1E2E')
             ax.axis('off')
+
+            legend_items: list[Patch] = [Patch(color="#ff0055", label="Кошелек")]
+            if categories_in_graph:
+                top_cats = [
+                    cat for cat, _ in Counter(node_to_category.values()).most_common(8)
+                    if cat in category_color_map
+                ]
+                for cat in top_cats:
+                    legend_items.append(Patch(color=category_color_map[cat], label=cat))
+
+            if len(legend_items) > 1:
+                legend = ax.legend(
+                    handles=legend_items,
+                    loc="lower left",
+                    fontsize=8,
+                    frameon=False,
+                )
+                for text in legend.get_texts():
+                    text.set_color("white")
+
             fig.tight_layout()
 
             canvas = FigureCanvasQTAgg(fig)
